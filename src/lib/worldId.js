@@ -1,14 +1,18 @@
 // World ID 4.0 configuration + proof verification.
 //
-// Verification flow (works identically in browsers and inside World App,
-// because IDKit v4 detects the World App webview and uses the native
-// transport automatically — no MiniKit needed):
+// Verification flow:
 //
 //   1. Browser asks our `rp-sign` Edge Function for an RP signature
 //      (Edge function holds the signing_key as a server secret and signs
 //       per the spec at https://docs.world.org/world-id/idkit/signatures).
 //   2. Browser opens IDKitRequestWidget with that signature in `rp_context`.
 //   3. User approves in World App, IDKit returns a proof payload.
+//      - On the web: IDKit polls Worldcoin's connect server for the proof.
+//      - Inside the World App webview: IDKit sends the verify command via
+//        webkit/Android postMessage and listens for the result via
+//        `window.MiniKit.subscribe('miniapp-verify-action', ...)`. That is
+//        why `main.jsx` calls `MiniKit.install(WORLD_APP_ID)` — without it,
+//        IDKit has no result-channel inside World App and the proof is lost.
 //   4. Browser POSTs the IDKit response to our `verify-world-id` Edge
 //      Function, which forwards it server-side to
 //      POST https://developer.world.org/api/v4/verify/{rp_id}.
