@@ -1,25 +1,20 @@
-// Supabase Edge Function: verify-world-id
+// Supabase Edge Function: verify-world-id (World ID 4.0)
 //
-// Why this exists
-// ---------------
-// The Worldcoin Developer Portal verify endpoint
-//   POST https://developer.worldcoin.org/api/v2/verify/{app_id}
-// is intended to be called server-to-server. It does not return permissive
-// CORS headers, so calling it directly from a browser (including the World
-// App webview) fails with "Failed to fetch" / network_error.
+// Verifies a World ID 4.0 IDKit response by forwarding it to the Worldcoin
+// Developer Portal v4 verify endpoint. The new endpoint accepts both 3.0 and
+// 4.0 proofs (when `allow_legacy_proofs: true` is used on the client) and is
+// keyed by the Relying Party id (`rp_id`), not the legacy `app_id`.
 //
-// This function takes the proof from the client, forwards it to the Developer
-// Portal from the edge, and returns the JSON response with proper CORS
-// headers so a static SPA can talk to it.
+// Why an edge function and not a direct browser fetch:
+// the Developer Portal verify endpoint is intended to be called
+// server-to-server and does not return permissive CORS headers. The edge
+// function is our backend.
 //
 // Deploy
 // ------
+//   supabase secrets set WORLD_RP_ID=rp_xxxxxxxx
+//   # Optional: WORLD_APP_ID is no longer used here, only kept for logging
 //   supabase functions deploy verify-world-id --no-verify-jwt
-//   supabase secrets set WORLD_APP_ID=app_xxxxxxxx WORLD_ACTION=verify-human
-//
-// `--no-verify-jwt` keeps the function callable from the SPA without
-// requiring a Supabase auth session. (We're already gating on the World ID
-// proof itself, which is the actual proof-of-personhood.)
 
 // deno-lint-ignore-file no-explicit-any
 
@@ -41,6 +36,25 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+// IDKit returns multiple possible response shapes (3.0 uniqueness, 4.0
+// uniqueness, 4.0 session). For storing per-human identity we want a single
+// stable hex nullifier. Pick the first response and choose the right field.
+function pickNullifier(idkitResponse: any): string | null {
+  const responses = idkitResponse?.responses;
+  if (!Array.isArray(responses) || responses.length === 0) return null;
+  const first = responses[0];
+
+  // 3.0 / 4.0 uniqueness proofs use `nullifier`.
+  if (typeof first?.nullifier === "string" && first.nullifier.length > 0) {
+    return first.nullifier;
+  }
+  // 4.0 session proofs use `session_nullifier` as a [nullifier, action] tuple.
+  if (Array.isArray(first?.session_nullifier) && first.session_nullifier[0]) {
+    return String(first.session_nullifier[0]);
+  }
+  return null;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -50,15 +64,14 @@ Deno.serve(async (req: Request) => {
     return json(405, { ok: false, code: "method_not_allowed" });
   }
 
-  const APP_ID = Deno.env.get("WORLD_APP_ID");
-  const DEFAULT_ACTION = Deno.env.get("WORLD_ACTION") ?? "verify-human";
-
-  if (!APP_ID || !APP_ID.startsWith("app_")) {
+  const RP_ID = Deno.env.get("WORLD_RP_ID");
+  if (!RP_ID || !RP_ID.startsWith("rp_")) {
+    console.error("[verify-world-id] WORLD_RP_ID is missing or malformed:", RP_ID);
     return json(500, {
       ok: false,
-      code: "app_id_missing",
+      code: "rp_id_missing",
       detail:
-        "WORLD_APP_ID is not configured on the edge function. Run `supabase secrets set WORLD_APP_ID=app_...`.",
+        "WORLD_RP_ID is not configured on the edge function. Run `supabase secrets set WORLD_RP_ID=rp_...`.",
     });
   }
 
@@ -73,46 +86,33 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  const required = [
-    "proof",
-    "merkle_root",
-    "nullifier_hash",
-    "verification_level",
-  ] as const;
-  for (const k of required) {
-    if (!payload?.[k] || typeof payload[k] !== "string") {
-      return json(400, {
-        ok: false,
-        code: "invalid_payload",
-        detail: `Missing or invalid field: ${k}`,
-      });
-    }
+  // Client posts { idkitResponse } — exactly the object IDKit returned to it.
+  // We forward it verbatim per Worldcoin's spec (no field remapping).
+  const idkitResponse = payload?.idkitResponse ?? payload;
+  if (!idkitResponse || typeof idkitResponse !== "object") {
+    return json(400, {
+      ok: false,
+      code: "invalid_payload",
+      detail: "Missing `idkitResponse` in request body.",
+    });
   }
 
-  const body: Record<string, string> = {
-    nullifier_hash: payload.nullifier_hash,
-    merkle_root: payload.merkle_root,
-    proof: payload.proof,
-    verification_level: payload.verification_level,
-    action: typeof payload.action === "string" && payload.action.length > 0
-      ? payload.action
-      : DEFAULT_ACTION,
-  };
-  if (typeof payload.signal === "string" && payload.signal.length > 0) {
-    body.signal = payload.signal;
-  }
+  console.log(
+    `[verify-world-id] forwarding to v4 rp_id=${RP_ID} protocol_version=${idkitResponse?.protocol_version} action=${idkitResponse?.action ?? "(session)"}`,
+  );
 
   let upstream: Response;
   try {
     upstream = await fetch(
-      `https://developer.worldcoin.org/api/v2/verify/${APP_ID}`,
+      `https://developer.world.org/api/v4/verify/${RP_ID}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(idkitResponse),
       },
     );
   } catch (err) {
+    console.error("[verify-world-id] upstream fetch failed:", err);
     return json(502, {
       ok: false,
       code: "upstream_unreachable",
@@ -129,18 +129,28 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!upstream.ok) {
+    const debug = `rp_id=${RP_ID} protocol=${idkitResponse?.protocol_version} action=${idkitResponse?.action ?? "(session)"}`;
+    console.warn(
+      `[verify-world-id] upstream ${upstream.status} ${
+        upstreamJson?.code ?? ""
+      } ${debug} — ${upstreamJson?.detail ?? ""}`,
+    );
     return json(upstream.status, {
       ok: false,
       code: upstreamJson?.code ?? `http_${upstream.status}`,
-      detail: upstreamJson?.detail ?? upstream.statusText ??
-        "Verification failed.",
+      detail: `${
+        upstreamJson?.detail ?? upstream.statusText ?? "Verification failed."
+      } (${debug})`,
+      attempted: { rp_id: RP_ID },
     });
   }
 
+  const nullifier = pickNullifier(idkitResponse);
+
   return json(200, {
     ok: true,
-    nullifier_hash: body.nullifier_hash,
-    verification_level: body.verification_level,
-    action: body.action,
+    nullifier_hash: nullifier,
+    protocol_version: idkitResponse?.protocol_version ?? null,
+    action: idkitResponse?.action ?? null,
   });
 });

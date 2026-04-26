@@ -8,8 +8,8 @@ ProofReview lets people post businesses, products, and services, then collect re
 
 - **React 18 + Vite**, mobile-first
 - **Tailwind CSS 3**
-- **Supabase** (Postgres + Realtime) for storage
-- **`@worldcoin/idkit`** + **`@worldcoin/minikit-js`** for proof-of-personhood
+- **Supabase** (Postgres + Realtime) for storage, plus 2 Edge Functions
+- **World ID 4.0** via **`@worldcoin/idkit`** v4 (single SDK works on web _and_ inside the World App webview)
 - **react-router-dom**
 
 ---
@@ -55,61 +55,95 @@ VITE_SUPABASE_URL=https://abcdefghijklm.supabase.co
 VITE_SUPABASE_ANON_KEY=eyJ...your-anon-key...
 ```
 
-### 3. Set up World ID
+### 3. Set up World ID 4.0
 
-1. Go to <https://developer.worldcoin.org/> and create an app.
-2. Set verification level to **Orb**.
+ProofReview targets **World ID 4.0**. The flow is:
+
+```
+Browser → /functions/rp-sign  (server signs an RP request)
+        → IDKit shows QR / native World App prompt
+        → user proves humanness
+Browser → /functions/verify-world-id  (server forwards to v4 verify)
+```
+
+#### 3a. Register the app
+
+1. Go to <https://developer.world.org/> and create an app.
+2. On the app page, click **Enable World ID 4.0** and complete RP registration.
 3. Add an **Action** with identifier `verify-human` (or pick your own and update `VITE_WORLD_ACTION` in `.env.local`).
-4. Copy the `app_id` (e.g. `app_staging_xxxxxxxx`) and paste it into `.env.local`:
+4. From the app page, copy these three values:
+   - **App ID** (e.g. `app_xxxxxxxx`) → `VITE_WORLD_APP_ID`
+   - **RP ID** (e.g. `rp_xxxxxxxx`) → `VITE_WORLD_RP_ID`
+   - **Signing key** — server secret. Save it for step 3c. **Never** commit it
+     or expose it to the browser. If it leaks, click **Reset signer key** in
+     the dashboard and rotate.
 
 ```bash
-VITE_WORLD_APP_ID=app_staging_xxxxxxxx
+VITE_WORLD_APP_ID=app_xxxxxxxx
+VITE_WORLD_RP_ID=rp_xxxxxxxx
 VITE_WORLD_ACTION=verify-human
 ```
 
-### 3b. Deploy the `verify-world-id` Edge Function (REQUIRED)
+#### 3b. Deploy both Edge Functions (REQUIRED)
 
-The Worldcoin Developer Portal's `/api/v2/verify/{app_id}` endpoint is meant
-to be called **server-to-server** and does not return permissive CORS
-headers, so calling it from the browser (including the World App webview)
-fails with `Failed to fetch` / `network_error`.
+The Developer Portal verify endpoint is server-to-server only and the
+signing key must never reach the browser. ProofReview ships two tiny
+Supabase Edge Functions to handle both responsibilities:
 
-ProofReview ships a tiny Supabase Edge Function in
-[`supabase/functions/verify-world-id`](./supabase/functions/verify-world-id)
-that does the server-side call for you. Deploy it once:
+- [`supabase/functions/rp-sign`](./supabase/functions/rp-sign) — signs RP
+  requests with `WORLD_SIGNING_KEY` per the
+  [signing spec](https://docs.world.org/world-id/idkit/signatures).
+- [`supabase/functions/verify-world-id`](./supabase/functions/verify-world-id)
+  — proxies `POST https://developer.world.org/api/v4/verify/{rp_id}`.
 
 ```bash
 # Install the Supabase CLI if you don't have it: https://supabase.com/docs/guides/cli
 supabase login
 supabase link --project-ref <your-project-ref>           # the part before .supabase.co
+```
 
-# Tell the function which World ID app + action to verify against.
+#### 3c. Set the function secrets
+
+```bash
 supabase secrets set \
-  WORLD_APP_ID=app_staging_xxxxxxxx \
+  WORLD_RP_ID=rp_xxxxxxxx \
+  WORLD_SIGNING_KEY=0xYOUR_RP_SIGNING_KEY \
   WORLD_ACTION=verify-human
+```
 
-# Deploy. --no-verify-jwt lets your SPA call it without a Supabase auth session
+#### 3d. Deploy
+
+```bash
+# --no-verify-jwt lets the SPA call them without a Supabase auth session
 # (the World ID proof is the actual auth here).
+supabase functions deploy rp-sign --no-verify-jwt
 supabase functions deploy verify-world-id --no-verify-jwt
 ```
 
 After deploy, the client automatically calls
-`${VITE_SUPABASE_URL}/functions/v1/verify-world-id`. No new client env vars
-are required.
+`${VITE_SUPABASE_URL}/functions/v1/rp-sign` and
+`${VITE_SUPABASE_URL}/functions/v1/verify-world-id`.
 
-To sanity-check from your terminal:
+#### 3e. Smoke-test from the terminal
 
 ```bash
+# rp-sign should issue a real signature for any action you ask for.
+curl -s -X POST \
+  -H "apikey: $VITE_SUPABASE_ANON_KEY" \
+  -H "Authorization: Bearer $VITE_SUPABASE_ANON_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"verify-human"}' \
+  https://<your-project-ref>.supabase.co/functions/v1/rp-sign | jq .
+
+# verify-world-id with a bogus payload should return HTTP 400 with
+# {"ok":false,"code":...} — that means the function is live and reachable.
 curl -i -X POST \
   -H "apikey: $VITE_SUPABASE_ANON_KEY" \
   -H "Authorization: Bearer $VITE_SUPABASE_ANON_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"proof":"x","merkle_root":"x","nullifier_hash":"x","verification_level":"orb"}' \
+  -d '{"idkitResponse":{}}' \
   https://<your-project-ref>.supabase.co/functions/v1/verify-world-id
 ```
-
-A bogus payload should return HTTP 400 with `{"ok":false,"code":...}` —
-that's how you know the function is live and reachable.
 
 ### 4. Run
 
@@ -125,7 +159,7 @@ If you see an amber banner at the top, it tells you what's still missing.
 
 1. `ngrok http 5173`
 2. Set the ngrok URL as your app's URL in the developer portal.
-3. Open from World App on your phone — MiniKit takes over and gives you the native verification flow.
+3. Open from World App on your phone — IDKit v4 detects the World App webview and switches to the native transport automatically (no separate SDK needed).
 
 ---
 
@@ -134,12 +168,12 @@ If you see an amber banner at the top, it tells you what's still missing.
 ```
 src/
 ├── App.jsx                     # Routes + shell (with setup banner)
-├── main.jsx                    # Entry, providers, MiniKit.install()
+├── main.jsx                    # Entry, providers
 ├── index.css                   # Tailwind + design tokens
 ├── lib/
 │   ├── supabase.js             # Supabase client (no fallback)
 │   ├── db.js                   # CRUD + realtime subscriptions
-│   ├── worldId.js              # MiniKit boot + REAL proof verification
+│   ├── worldId.js              # World ID 4.0 client: rp-sign + verify
 │   ├── format.js               # Categories, time-ago, hash shortener
 │   └── trustScore.js           # 0–100 trust score formula
 ├── context/
@@ -152,7 +186,7 @@ src/
 │   ├── Header.jsx
 │   ├── MobileNav.jsx
 │   ├── SetupNotice.jsx         # "Supabase / World ID not configured" banner
-│   ├── VerifyButton.jsx        # MiniKit + IDKit + portal verification
+│   ├── VerifyButton.jsx        # IDKitRequestWidget + v4 portal verification
 │   ├── VerifiedBadge.jsx
 │   ├── ListingCard.jsx
 │   ├── ReviewForm.jsx          # 1-human-1-review enforcement + edit mode
@@ -171,8 +205,10 @@ src/
 supabase/
 ├── schema.sql                  # Run this once in the Supabase SQL editor
 └── functions/
-    └── verify-world-id/        # Edge Function that proxies the proof to
-        └── index.ts            # developer.worldcoin.org (CORS-safe)
+    ├── rp-sign/                # Signs RP requests with WORLD_SIGNING_KEY
+    │   └── index.ts
+    └── verify-world-id/        # Proxies POST /api/v4/verify/{rp_id}
+        └── index.ts
 ```
 
 ## Database schema (Postgres / Supabase)
@@ -213,7 +249,10 @@ The deterministic `votes.id` and the `UNIQUE` constraints on `(listing_id, user_
 ## How verification gates work
 
 - **Browse:** anyone can browse and read.
-- **Add listing / review / vote:** require an active verified-human session (`AuthContext.isVerified`), which is only set after a successful World Developer Portal proof verification. The browser POSTs the proof to our `verify-world-id` Supabase Edge Function, which forwards it server-side to `POST https://developer.worldcoin.org/api/v2/verify/{app_id}`.
+- **Add listing / review / vote:** require an active verified-human session (`AuthContext.isVerified`), which is only set after a successful World ID 4.0 proof verification. The browser:
+  1. Calls our `rp-sign` Edge Function to get a signed RP context.
+  2. Opens IDKit v4 with that context; the user proves humanness in World App.
+  3. Forwards the IDKit response to our `verify-world-id` Edge Function, which calls `POST https://developer.world.org/api/v4/verify/{rp_id}` server-side.
 - **One human = one review:** `findReviewByUser` runs before submit; the form switches into _edit_ mode if the human already reviewed this listing.
 - **One human = one vote:** the deterministic `votes.id` plus the unique `(listing_id, user_id)` constraint guarantee it.
 
