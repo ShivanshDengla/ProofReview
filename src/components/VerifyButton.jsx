@@ -56,8 +56,18 @@ export default function VerifyButton({
   const { signIn, isVerified, signOut } = useAuth();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [status, setStatus] = useState('');
   const [open, setOpen] = useState(false);
   const [rpContext, setRpContext] = useState(null);
+
+  // Diagnostic logger — also shows on screen so we can debug in World App
+  // (where the dev console isn't available). Status messages are short-lived
+  // and replaced on every step.
+  function trace(message, extra) {
+    setStatus(message);
+    // eslint-disable-next-line no-console
+    console.log(`[ProofReview] ${message}`, extra ?? '');
+  }
 
   const buttonClass =
     variant === 'primary'
@@ -83,13 +93,15 @@ export default function VerifyButton({
   async function handleStart() {
     if (busy) return;
     setError('');
+    setStatus('');
     if (!isWorldIdConfigured()) {
       setError(
-        'World ID is not configured. Set VITE_WORLD_APP_ID and VITE_WORLD_RP_ID in .env.local.',
+        'World ID is not configured. Set VITE_WORLD_APP_ID and VITE_WORLD_RP_ID in .env.local (and Vercel env vars).',
       );
       return;
     }
     setBusy(true);
+    trace('1/4 requesting RP signature…');
     try {
       const result = await fetchRpContext(WORLD_ACTION);
       if (!result.ok) {
@@ -100,6 +112,7 @@ export default function VerifyButton({
         );
         return;
       }
+      trace('2/4 opening World ID widget…');
       setRpContext(result.rp_context);
       setOpen(true);
     } catch (err) {
@@ -112,6 +125,7 @@ export default function VerifyButton({
   // ----- IDKit handed us a proof: forward it to our verify backend -----
   async function handleVerify(idkitResult) {
     setError('');
+    trace('3/4 received proof from World App, verifying server-side…', idkitResult);
     setBusy(true);
     try {
       const verification = await verifyWorldIdProof(idkitResult);
@@ -127,7 +141,9 @@ export default function VerifyButton({
         // Throwing rejects the proof in the IDKit UI so the user sees an error.
         throw new Error(msg);
       }
+      trace('4/4 verified, signing in…', verification);
       await signIn({ nullifier_hash: verification.nullifier_hash });
+      trace('signed in!');
     } finally {
       setBusy(false);
     }
@@ -206,9 +222,18 @@ export default function VerifyButton({
           onError={(err) => {
             // eslint-disable-next-line no-console
             console.warn('[ProofReview] IDKit error', err);
-            setError(err?.message || 'Verification was cancelled or failed.');
+            setError(
+              err?.message ||
+                err?.code ||
+                'Verification was cancelled or failed.',
+            );
           }}
         />
+      )}
+      {status && !error && (
+        <p className="max-w-xs rounded-md bg-slate-100 px-2 py-1 text-[11px] text-slate-700 dark:bg-slate-700/30 dark:text-slate-200">
+          {status}
+        </p>
       )}
       {error && (
         <p className="max-w-xs rounded-md bg-rose-50 px-2 py-1 text-[11px] text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
