@@ -64,14 +64,22 @@ Deno.serve(async (req: Request) => {
     return json(405, { ok: false, code: "method_not_allowed" });
   }
 
-  const RP_ID = Deno.env.get("WORLD_RP_ID");
-  if (!RP_ID || !RP_ID.startsWith("rp_")) {
-    console.error("[verify-world-id] WORLD_RP_ID is missing or malformed:", RP_ID);
+  // Trim aggressively to survive copy/paste mishaps (trailing backslash from
+  // a `\` line continuation, stray spaces, newlines, etc.) ending up in the
+  // secret value.
+  const RP_ID = (Deno.env.get("WORLD_RP_ID") ?? "")
+    .trim()
+    .replace(/[\s\\]+$/g, "");
+  if (!RP_ID || !/^rp_[A-Za-z0-9]+$/.test(RP_ID)) {
+    console.error(
+      "[verify-world-id] WORLD_RP_ID is missing or malformed:",
+      JSON.stringify(Deno.env.get("WORLD_RP_ID")),
+    );
     return json(500, {
       ok: false,
       code: "rp_id_missing",
       detail:
-        "WORLD_RP_ID is not configured on the edge function. Run `supabase secrets set WORLD_RP_ID=rp_...`.",
+        "WORLD_RP_ID is not configured (or contains stray whitespace/backslashes). Run `supabase secrets set WORLD_RP_ID=rp_...` with no trailing characters.",
     });
   }
 

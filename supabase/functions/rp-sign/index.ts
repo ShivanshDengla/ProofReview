@@ -184,16 +184,25 @@ Deno.serve(async (req: Request) => {
     return json(405, { ok: false, code: "method_not_allowed" });
   }
 
-  const SIGNING_KEY = Deno.env.get("WORLD_SIGNING_KEY");
-  const DEFAULT_ACTION = Deno.env.get("WORLD_ACTION") ?? "verify-human";
+  // Trim aggressively to survive copy/paste mishaps (trailing backslash from
+  // a `\` line continuation, stray spaces, newlines, etc.) ending up in the
+  // secret value. We never want to sign with junk bytes.
+  const SIGNING_KEY = (Deno.env.get("WORLD_SIGNING_KEY") ?? "")
+    .trim()
+    .replace(/[\s\\]+$/g, "");
+  const DEFAULT_ACTION = (Deno.env.get("WORLD_ACTION") ?? "verify-human")
+    .trim()
+    .replace(/[\s\\]+$/g, "");
 
-  if (!SIGNING_KEY) {
-    console.error("[rp-sign] WORLD_SIGNING_KEY secret is not set");
+  if (!SIGNING_KEY || !/^0x[0-9a-fA-F]{64}$/.test(SIGNING_KEY)) {
+    console.error(
+      "[rp-sign] WORLD_SIGNING_KEY secret is missing or malformed (expected 0x + 64 hex chars).",
+    );
     return json(500, {
       ok: false,
       code: "signing_key_missing",
       detail:
-        "WORLD_SIGNING_KEY is not configured on the edge function. Run `supabase secrets set WORLD_SIGNING_KEY=0x...`.",
+        "WORLD_SIGNING_KEY is not configured (or contains stray whitespace/backslashes). Run `supabase secrets set WORLD_SIGNING_KEY=0x...` with no trailing characters.",
     });
   }
 
